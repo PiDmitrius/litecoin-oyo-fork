@@ -195,6 +195,7 @@ BASE_SCRIPTS = [
     'p2p_invalid_tx.py',
     'feature_assumevalid.py',
     'example_test.py',
+    'rpc_oyo.py',
     'wallet_txn_doublespend.py',
     'wallet_txn_doublespend.py --descriptors',
     'feature_backwards_compatibility.py',

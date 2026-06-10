@@ -4733,6 +4733,286 @@ RPCHelpMan importaddress();
 RPCHelpMan importpubkey();
 RPCHelpMan dumpwallet();
 RPCHelpMan importwallet();
+// oyo-send - single-recipient send with optional dry_run preview.
+//
+// Replaces the explicit-input-selection RPC of the same name (the
+// matching frontend "Advanced send" flow was retired together with
+// the old RPC). The new shape is much simpler: one recipient, one
+// amount, options object. The wallet picks inputs as it would for
+// sendtoaddress (regular / peg-in / peg-out / pure-MWEB selected
+// from destination class and balances available on each side).
+//
+// The dry_run option builds and signs the transaction but does NOT
+// broadcast it - the result carries the signed tx_hex plus the
+// decoded fee/vsize so the caller can show a confirmation modal,
+// then commit by re-sending the tx_hex through sendrawtransaction.
+static RPCHelpMan oyo_send()
+{
+    return RPCHelpMan{"oyo-send",
+                "\nSend `amount` to `address`. The wallet auto-selects inputs and the appropriate path "
+                "(regular P2WPKH, peg-in to MWEB, peg-out from MWEB, or pure MWEB-to-MWEB) based on the "
+                "destination class and the balances on each side. With dry_run=true the tx is built and "
+                "signed but NOT broadcast - useful for pre-broadcast confirmation modals.\n",
+                {
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Recipient address (canonical or MWEB stealth)."},
+                    {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount in " + CURRENCY_UNIT + ". Ignored if options.send_all is true."},
+                    {"options", RPCArg::Type::OBJ, /* default */ "{}", "Options",
+                        {
+                            {"send_all", RPCArg::Type::BOOL, /* default */ "false", "Drain all available funds (amount field is ignored). subtract_fee_from_amount is implied true."},
+                            {"subtract_fee_from_amount", RPCArg::Type::BOOL, /* default */ "false", "Deduct the actual computed fee from the recipient's amount."},
+                            {"fee_rate", RPCArg::Type::AMOUNT, /* default */ "wallet fee estimation", "Fee rate in " + CURRENCY_ATOM + "/vB."},
+                            {"dry_run", RPCArg::Type::BOOL, /* default */ "false", "Build + sign but do NOT broadcast."},
+                        },
+                    },
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "txid", "Transaction id."},
+                        {RPCResult::Type::STR_HEX, "tx_hex", "Signed (unbroadcast) transaction hex - also returned when dry_run=false."},
+                        {RPCResult::Type::NUM, "fee_sat", "Actual fee paid (canonical wrapper + MWEB kernel)."},
+                        {RPCResult::Type::NUM, "vsize", "Virtual size in vbytes."},
+                        {RPCResult::Type::NUM, "fee_rate_sat_per_vb", "fee_sat / vsize (rounded)."},
+                        {RPCResult::Type::NUM, "amount_sat", "Recipient amount after subtract-fee adjustments."},
+                        {RPCResult::Type::BOOL, "broadcast", "True if this RPC also broadcast the tx (dry_run=false)."},
+                    },
+                },
+                RPCExamples{
+                    HelpExampleCli("oyo-send", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.5")
+                    + HelpExampleCli("oyo-send", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.5 '{\"dry_run\":true}'")
+                    + HelpExampleCli("oyo-send", "\"" + EXAMPLE_ADDRESS[0] + "\" 0 '{\"send_all\":true,\"dry_run\":true}'")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+    if (!wallet) return NullUniValue;
+    CWallet* const pwallet = wallet.get();
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK(pwallet->cs_wallet);
+
+    EnsureWalletIsUnlocked(pwallet);
+
+    if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+    }
+
+    const std::string address = request.params[0].get_str();
+    CAmount amount = AmountFromValue(request.params[1]);
+
+    UniValue options(UniValue::VOBJ);
+    if (!request.params[2].isNull()) {
+        options = request.params[2].get_obj();
+    }
+    const bool send_all     = options.exists("send_all")     && options["send_all"].get_bool();
+    bool subtract_fee       = options.exists("subtract_fee_from_amount") && options["subtract_fee_from_amount"].get_bool();
+    const bool dry_run      = options.exists("dry_run")      && options["dry_run"].get_bool();
+
+    if (send_all) {
+        // send_all implies "spend everything to recipient minus fee".
+        amount = pwallet->GetBalance().m_mine_trusted;
+        if (amount <= 0) {
+            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "send_all: wallet has no spendable balance");
+        }
+        subtract_fee = true;
+    }
+
+    CCoinControl coin_control;
+    coin_control.m_add_inputs = true;        // wallet picks inputs
+    coin_control.fAllowOtherInputs = true;
+    if (options.exists("fee_rate")) {
+        coin_control.m_feerate = CFeeRate(AmountFromValue(options["fee_rate"]) * 1000); // sat/vB -> sat/kvB
+        coin_control.fOverrideFeeRate = true;
+    }
+
+    // Build the single-recipient list.
+    UniValue address_amounts(UniValue::VOBJ);
+    address_amounts.pushKV(address, ValueFromAmount(amount));
+    UniValue subtractFeeFromAmount(UniValue::VARR);
+    if (subtract_fee) subtractFeeFromAmount.push_back(address);
+    std::vector<CRecipient> recipients;
+    ParseRecipients(address_amounts, subtractFeeFromAmount, recipients);
+
+    // Build + sign without broadcasting (mirrors the body of SendMoney
+    // up to but not including CommitTransaction).
+    CAmount fee_required = 0;
+    int change_pos_ret = -1;
+    bilingual_str error;
+    CTransactionRef tx;
+    FeeCalculation fee_calc_out;
+    if (!pwallet->CreateTransaction(recipients, tx, fee_required, change_pos_ret, error, coin_control, fee_calc_out, true)) {
+        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, error.original);
+    }
+
+    // Decode summary fields.
+    CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);
+    ssTx << tx;
+    const std::string tx_hex = HexStr(ssTx);
+    const int64_t vsize = GetVirtualTransactionSize(*tx);
+    const int64_t fee_rate_sat_per_vb = vsize > 0 ? (fee_required + vsize - 1) / vsize : 0;
+
+    // Recipient amount AFTER fee subtraction. With subtract_fee=true
+    // the wallet builds the tx as if recipient gets nAmount, then
+    // shaves the fee off the recipient's vout so the inputs balance.
+    // Without subtract_fee the recipient gets the raw nAmount and the
+    // sender pays fee from change. Frontend modal needs the actual
+    // recipient credit, not the pre-adjustment number.
+    CAmount recipient_amount_after = recipients.empty() ? 0 : recipients[0].nAmount;
+    if (subtract_fee) {
+        recipient_amount_after -= fee_required;
+    }
+
+    // Path label: classified by destination type + which UTXO sets the
+    // wallet had to dip into. Destination-driven (not just tx markers)
+    // because send_all on a mixed-balance wallet builds a hybrid tx
+    // with BOTH peg-in markers (intermediate) and peg-out coins to a
+    // canonical recipient - labelling that "peg-in" hides the actual
+    // user-visible direction.
+    //
+    //   regular  - no MWEB extension at all (plain P2WPKH spend).
+    //   peg-in   - destination is MWEB; tx has a canonical input
+    //              crossing into MWEB.
+    //   mweb     - destination is MWEB; tx is pure M->M (MWEB inputs
+    //              only, no canonical crossing).
+    //   peg-out  - destination is canonical; tx pulls from MWEB
+    //              (kernel emits a peg-out coin landing in HogEx).
+    //              Mixed-balance send_all to bech32 also lands here:
+    //              even if the tx carries a peg-in marker as part of
+    //              the hybrid construction, the user-visible flow
+    //              ends in canonical bech32 via peg-out.
+    CTxDestination dest_classify = DecodeDestination(address);
+    const bool dest_is_mweb = boost::get<StealthAddress>(&dest_classify) != nullptr;
+    std::string path = "regular";
+    if (tx->HasMWEBTx()) {
+        if (dest_is_mweb) {
+            // Any canonical input means peg-in must move it across.
+            path = tx->vin.empty() ? "mweb" : "peg-in";
+        } else {
+            path = "peg-out";
+        }
+    }
+
+    // Decode inputs from tx.vin against the wallet's UTXO set so the
+    // confirm modal can show the user where the money's coming from
+    // (address + amount per outpoint). MWEB-side inputs (kernels with
+    // input commitments) are summarised separately as a single
+    // mweb-input row to keep the modal readable.
+    UniValue inputs_arr(UniValue::VARR);
+    for (const CTxIn& in : tx->vin) {
+        UniValue ent(UniValue::VOBJ);
+        ent.pushKV("txid", in.prevout.hash.GetHex());
+        ent.pushKV("vout", int64_t(in.prevout.n));
+        auto wit = pwallet->mapWallet.find(in.prevout.hash);
+        if (wit != pwallet->mapWallet.end() && in.prevout.n < wit->second.tx->vout.size()) {
+            const CTxOut& src_out = wit->second.tx->vout[in.prevout.n];
+            CTxDestination dest;
+            std::string addr;
+            if (ExtractDestination(src_out.scriptPubKey, dest) && IsValidDestination(dest))
+                addr = EncodeDestination(dest);
+            ent.pushKV("amount_sat", int64_t(src_out.nValue));
+            ent.pushKV("address", addr);
+            ent.pushKV("kind", "p2wpkh");
+        } else {
+            ent.pushKV("amount_sat", int64_t(0));
+            ent.pushKV("address", "");
+            ent.pushKV("kind", "?");
+        }
+        ent.pushKV("status", "confirmed");
+        inputs_arr.push_back(ent);
+    }
+    if (tx->HasMWEBTx() && tx->mweb_tx.m_transaction) {
+        for (const auto& mw_in : tx->mweb_tx.m_transaction->GetInputs()) {
+            UniValue ent(UniValue::VOBJ);
+            ent.pushKV("kind", "mweb");
+            ent.pushKV("address", "(MWEB input)");
+            ent.pushKV("amount_sat", int64_t(0));            // unknown without kernel rewind
+            ent.pushKV("commitment", mw_in.GetCommitment().ToHex());
+            ent.pushKV("status", "confirmed");
+            inputs_arr.push_back(ent);
+        }
+    }
+
+    // Decode canonical vouts. Peg-in (OP_8 + kernel_id) is shown as a
+    // "kernel" row that the frontend can fold behind an Advanced
+    // toggle; everything else is matched against the recipient
+    // address to label as recipient vs change.
+    UniValue outputs_arr(UniValue::VARR);
+    for (const CTxOut& o : tx->vout) {
+        UniValue ent(UniValue::VOBJ);
+        if (o.scriptPubKey.IsMWEBPegin()) {
+            ent.pushKV("kind", "kernel");
+            ent.pushKV("address", "");
+            ent.pushKV("amount_sat", int64_t(o.nValue));
+            ent.pushKV("label", "kernel");
+        } else {
+            CTxDestination dest;
+            std::string addr;
+            if (ExtractDestination(o.scriptPubKey, dest) && IsValidDestination(dest))
+                addr = EncodeDestination(dest);
+            ent.pushKV("kind", "p2wpkh");
+            ent.pushKV("address", addr);
+            ent.pushKV("amount_sat", int64_t(o.nValue));
+            ent.pushKV("label", addr == address ? "recipient" : "change");
+        }
+        outputs_arr.push_back(ent);
+    }
+    // MWEB-side outputs.
+    //
+    // MWEB-side recipient row: only synthesise when the destination is
+    // actually an MWEB stealth address (peg-in or pure mweb). In hybrid
+    // send_all flows the tx has a peg-in marker as intermediate
+    // plumbing but the user's destination is canonical - the pegout
+    // coin row below is the real recipient there. Synthesising an
+    // mweb row off `address` for those cases would double-render the
+    // recipient with a misleading kind=mweb tag.
+    if (dest_is_mweb && tx->HasMWEBTx()) {
+        UniValue ent(UniValue::VOBJ);
+        ent.pushKV("kind", "mweb");
+        ent.pushKV("address", address);
+        ent.pushKV("amount_sat", recipient_amount_after);
+        ent.pushKV("label", "recipient");
+        outputs_arr.push_back(ent);
+    }
+    if (tx->HasMWEBTx()) {
+        for (const auto& pegout : tx->mweb_tx.GetPegOuts()) {
+            CTxDestination dest;
+            std::string addr;
+            if (ExtractDestination(pegout.GetScriptPubKey(), dest) && IsValidDestination(dest))
+                addr = EncodeDestination(dest);
+            UniValue ent(UniValue::VOBJ);
+            ent.pushKV("kind", "pegout");
+            ent.pushKV("address", addr);
+            ent.pushKV("amount_sat", int64_t(pegout.GetAmount()));
+            ent.pushKV("label", addr == address ? "recipient" : "change");
+            outputs_arr.push_back(ent);
+        }
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("txid", tx->GetHash().GetHex());
+    result.pushKV("tx_hex", tx_hex);
+    result.pushKV("fee_sat", fee_required);
+    result.pushKV("vsize", vsize);
+    result.pushKV("fee_rate_sat_per_vb", fee_rate_sat_per_vb);
+    result.pushKV("amount_sat", recipient_amount_after);
+    result.pushKV("path", path);
+    result.pushKV("inputs", inputs_arr);
+    result.pushKV("outputs", outputs_arr);
+    result.pushKV("broadcast", !dry_run);
+
+    if (!dry_run) {
+        pwallet->CommitTransaction(tx, {} /* mapValue */, {} /* orderForm */);
+    }
+    return result;
+},
+    };
+}
+
+RPCHelpMan oyo_version();
+RPCHelpMan oyo_backupwallet();
+RPCHelpMan oyo_restorewallet();
+RPCHelpMan oyo_deletewallet();
 RPCHelpMan importprunedfunds();
 RPCHelpMan removeprunedfunds();
 RPCHelpMan importmulti();
@@ -4773,6 +5053,11 @@ static const CRPCCommand commands[] =
     { "wallet",             "importprunedfunds",                &importprunedfunds,             {"rawtransaction","txoutproof"} },
     { "wallet",             "importpubkey",                     &importpubkey,                  {"pubkey","label","rescan"} },
     { "wallet",             "importwallet",                     &importwallet,                  {"filename"} },
+    { "wallet",             "oyo-version",                      &oyo_version,                   {} },
+    { "wallet",             "oyo-backupwallet",                 &oyo_backupwallet,              {"wallet_name"} },
+    { "wallet",             "oyo-restorewallet",                &oyo_restorewallet,             {"wallet_name", "data"} },
+    { "wallet",             "oyo-deletewallet",                 &oyo_deletewallet,              {"wallet_name"} },
+    { "wallet",             "oyo-send",                         &oyo_send,                      {"address", "amount", "options"} },
     { "wallet",             "keypoolrefill",                    &keypoolrefill,                 {"newsize"} },
     { "wallet",             "listaddressgroupings",             &listaddressgroupings,          {} },
     { "wallet",             "listlabels",                       &listlabels,                    {"purpose"} },

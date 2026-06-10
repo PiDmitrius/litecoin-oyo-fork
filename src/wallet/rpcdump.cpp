@@ -18,6 +18,11 @@
 #include <util/translation.h>
 #include <wallet/rpcwallet.h>
 #include <wallet/wallet.h>
+#include <wallet/walletutil.h>
+#include <util/strencodings.h>
+#include <fstream>
+
+#include <sstream>
 
 #include <stdint.h>
 #include <tuple>
@@ -1758,6 +1763,274 @@ RPCHelpMan importdescriptors()
     }
 
     return response;
+},
+    };
+}
+
+// OYO extensions - in-memory wallet dump/import via RPC (no filesystem access needed)
+
+
+RPCHelpMan oyo_version()
+{
+    return RPCHelpMan{"oyo-version",
+                "\nReturns OYO extension version and supported features.\n",
+                {},
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "version", "OYO protocol version"},
+                        {RPCResult::Type::ARR, "features", "List of supported OYO features",
+                            {
+                                {RPCResult::Type::STR, "", "feature name"},
+                            }},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("oyo-version", "")
+            + HelpExampleRpc("oyo-version", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("version", 4);
+    UniValue features(UniValue::VARR);
+    features.push_back("oyo-backupwallet");
+    features.push_back("oyo-restorewallet");
+    features.push_back("oyo-deletewallet");
+    features.push_back("oyo-send");
+    result.pushKV("features", features);
+    return result;
+},
+    };
+}
+
+RPCHelpMan oyo_backupwallet()
+{
+    return RPCHelpMan{"oyo-backupwallet",
+                "\nReads an unloaded wallet file from disk and returns it as base64.\n"
+                "The wallet must NOT be loaded. Use unloadwallet first.\n",
+                {
+                    {"wallet_name", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet name to backup"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "data", "Base64-encoded wallet.dat contents"},
+                        {RPCResult::Type::NUM, "size", "File size in bytes"},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("oyo-backupwallet", "\"my-wallet\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::string wallet_name = request.params[0].get_str();
+    if (wallet_name.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Wallet name cannot be empty");
+    }
+
+    // Safety: wallet must NOT be loaded
+    auto wallets = GetWallets();
+    for (const auto& w : wallets) {
+        if (w->GetName() == wallet_name) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently loaded. Unload it first.");
+        }
+    }
+
+    // Find wallet.dat on disk
+    fs::path wallet_dir = GetWalletDir();
+    fs::path wallet_path = wallet_dir / wallet_name / "wallet.dat";
+
+    if (!fs::exists(wallet_path)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet file not found: " + wallet_path.string());
+    }
+
+    // Path traversal protection
+    fs::path canonical_dir = fs::canonical(wallet_dir);
+    fs::path canonical_file = fs::canonical(wallet_path);
+    if (canonical_file.string().substr(0, canonical_dir.string().size()) != canonical_dir.string()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid wallet path");
+    }
+
+    // Read file
+    std::ifstream file(wallet_path.string(), std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot open wallet file");
+    }
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<char> buffer(size);
+    if (!file.read(buffer.data(), size)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot read wallet file");
+    }
+    file.close();
+
+    // Encode to base64
+    std::string base64 = EncodeBase64(MakeUCharSpan(buffer));
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("data", base64);
+    result.pushKV("size", (int64_t)size);
+    return result;
+},
+    };
+}
+
+RPCHelpMan oyo_restorewallet()
+{
+    return RPCHelpMan{"oyo-restorewallet",
+                "\nRestores a wallet from base64-encoded wallet.dat data.\n"
+                "Creates a new wallet directory and writes the file. Does NOT load the wallet.\n"
+                "A wallet with the given name must not already exist.\n",
+                {
+                    {"wallet_name", RPCArg::Type::STR, RPCArg::Optional::NO, "The name for the restored wallet"},
+                    {"data", RPCArg::Type::STR, RPCArg::Optional::NO, "Base64-encoded wallet.dat contents"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "name", "Name of restored wallet"},
+                        {RPCResult::Type::NUM, "size", "Written file size in bytes"},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleRpc("oyo-restorewallet", "\"restored-wallet\", \"<base64>\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::string wallet_name = request.params[0].get_str();
+    std::string base64_data = request.params[1].get_str();
+
+    if (wallet_name.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Wallet name cannot be empty");
+    }
+
+    // Check wallet doesn't already exist
+    fs::path wallet_dir = GetWalletDir();
+    fs::path wallet_path = wallet_dir / wallet_name;
+
+    if (fs::exists(wallet_path)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet already exists: " + wallet_name);
+    }
+
+    // Path traversal protection
+    fs::path canonical_dir = fs::canonical(wallet_dir);
+    fs::path intended = canonical_dir / wallet_name;
+    // Normalize by checking the parent resolves inside wallet_dir
+    if (wallet_name.find("..") != std::string::npos || wallet_name.find('/') != std::string::npos) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid wallet name");
+    }
+
+    // Decode base64
+    bool invalid = false;
+    std::vector<unsigned char> decoded = DecodeBase64(base64_data.c_str(), &invalid);
+    if (invalid || decoded.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid base64 data");
+    }
+
+    // Create directory and write file
+    fs::create_directories(wallet_path);
+    fs::path file_path = wallet_path / "wallet.dat";
+
+    std::ofstream file(file_path.string(), std::ios::binary);
+    if (!file.is_open()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot create wallet file");
+    }
+    file.write(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+    file.close();
+
+    LogPrintf("OYO: Restored wallet to disk: %s (%d bytes)\n", wallet_name, decoded.size());
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("name", wallet_name);
+    result.pushKV("size", (int64_t)decoded.size());
+    return result;
+},
+    };
+}
+
+RPCHelpMan oyo_deletewallet()
+{
+    return RPCHelpMan{"oyo-deletewallet",
+                "\nPermanently deletes an unloaded wallet from disk.\n"
+                "The wallet must NOT be loaded. Use unloadwallet first.\n"
+                "WARNING: This is irreversible. Make sure you have a backup.\n",
+                {
+                    {"wallet_name", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet name to delete"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "deleted", "Name of deleted wallet"},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("oyo-deletewallet", "\"old-wallet\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::string wallet_name = request.params[0].get_str();
+    if (wallet_name.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Wallet name cannot be empty");
+    }
+
+    // Safety: check wallet is NOT loaded
+    auto wallets = GetWallets();
+    for (const auto& w : wallets) {
+        if (w->GetName() == wallet_name) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently loaded. Unload it first with unloadwallet.");
+        }
+    }
+
+    // Verify wallet exists on disk
+    fs::path wallet_dir = GetWalletDir();
+    fs::path wallet_path = wallet_dir / wallet_name;
+
+    if (!fs::exists(wallet_path)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet not found on disk: " + wallet_name);
+    }
+
+    // Safety: ensure path is inside wallet_dir (prevent directory traversal)
+    fs::path canonical_dir = fs::canonical(wallet_dir);
+    fs::path canonical_wallet = fs::canonical(wallet_path);
+    std::string dir_str = canonical_dir.string();
+    std::string wallet_str = canonical_wallet.string();
+    if (wallet_str.substr(0, dir_str.size()) != dir_str) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid wallet path");
+    }
+
+    // Secure delete: overwrite wallet.dat with zeros before removing
+    fs::path wallet_file = wallet_path / "wallet.dat";
+    if (fs::exists(wallet_file)) {
+        std::uintmax_t fsize = fs::file_size(wallet_file);
+        std::ofstream ofs(wallet_file.string(), std::ios::binary | std::ios::in | std::ios::out);
+        if (ofs.is_open()) {
+            std::vector<char> zeros(std::min(fsize, (std::uintmax_t)(1024 * 1024)), 0);
+            std::uintmax_t written = 0;
+            while (written < fsize) {
+                std::uintmax_t chunk = std::min((std::uintmax_t)zeros.size(), fsize - written);
+                ofs.write(zeros.data(), chunk);
+                written += chunk;
+            }
+            ofs.flush();
+            ofs.close();
+        }
+        LogPrintf("OYO: Securely wiped wallet.dat (%d bytes): %s\n", fsize, wallet_name);
+    }
+
+    // Remove entire wallet directory
+    boost::system::error_code ec;
+    fs::remove_all(wallet_path, ec);
+    if (ec) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to delete wallet: " + ec.message());
+    }
+
+    LogPrintf("OYO: Deleted wallet from disk: %s\n", wallet_name);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("deleted", wallet_name);
+    return result;
 },
     };
 }

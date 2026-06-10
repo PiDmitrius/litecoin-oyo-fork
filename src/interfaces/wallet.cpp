@@ -590,7 +590,11 @@ public:
     //! ChainClient methods
     void registerRpcs() override
     {
+        const bool oyo_enabled = gArgs.GetBoolArg("-oyo", true);
         for (const CRPCCommand& command : GetWalletRPCCommands()) {
+            if (!oyo_enabled && command.name.rfind("oyo-", 0) == 0) {
+                continue;
+            }
             m_rpc_commands.emplace_back(command.category, command.name, [this, &command](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
                 return command.actor({request, m_context}, result, last_handler);
             }, command.argNames, command.unique_id);

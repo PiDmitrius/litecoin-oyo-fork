@@ -1256,10 +1256,11 @@ void LegacyScriptPubKeyMan::SetHDSeed(const CPubKey& seed)
     newHdChain.nVersion = m_storage.CanSupportFeature(FEATURE_HD_SPLIT) ? CHDChain::VERSION_HD_MWEB : CHDChain::VERSION_HD_BASE;
     newHdChain.seed_id = seed.GetID();
     AddHDChain(newHdChain);
-    LoadMWEBKeychain();
-    NotifyCanGetAddressesChanged();
+    // Clear blank flag before loading MWEB keychain; LoadMWEBKeychain skips blank wallets.
     WalletBatch batch(m_storage.GetDatabase());
     m_storage.UnsetBlankWalletFlag(batch);
+    LoadMWEBKeychain();
+    NotifyCanGetAddressesChanged();
 }
 
 /**
